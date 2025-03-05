@@ -1,0 +1,127 @@
+# AWS Databricks Modern Data Engineering Architecture
+# variables.tf - Terraform Variables
+
+# AWS Configuration
+variable "aws_region" {
+  description = "AWS region to deploy resources"
+  type        = string
+  default     = "us-east-1"
+}
+
+variable "aws_account_id" {
+  description = "AWS account ID"
+  type        = string
+}
+
+variable "environment" {
+  description = "Deployment environment (e.g., dev, staging, production)"
+  type        = string
+  default     = "dev"
+}
+
+# VPC Configuration
+variable "vpc_id" {
+  description = "VPC ID where resources will be deployed"
+  type        = string
+}
+
+variable "subnet_ids" {
+  description = "Subnet IDs for deploying resources"
+  type        = list(string)
+}
+
+# Databricks Configuration
+variable "databricks_host" {
+  description = "Databricks workspace URL"
+  type        = string
+}
+
+variable "databricks_token" {
+  description = "Databricks access token"
+  type        = string
+  sensitive   = true
+}
+
+variable "databricks_account_id" {
+  description = "Databricks account ID for cross-account access"
+  type        = string
+}
+
+variable "databricks_external_id" {
+  description = "External ID for the cross-account role"
+  type        = string
+}
+
+# Data Lake Configuration
+variable "data_zones" {
+  description = "Data lake zones (medallion architecture)"
+  type        = list(string)
+  default     = ["raw", "processed", "curated"]
+}
+
+variable "transition_days" {
+  description = "Days after which to transition objects to IA storage by zone"
+  type        = map(number)
+  default     = {
+    "raw"       = 30
+    "processed" = 60
+    "curated"   = 90
+  }
+}
+
+# Kinesis Configuration
+variable "kinesis_shard_count" {
+  description = "Number of shards for Kinesis stream"
+  type        = number
+  default     = 4
+}
+
+# DMS Configuration
+variable "dms_instance_type" {
+  description = "Instance type for DMS replication instance"
+  type        = string
+  default     = "dms.t3.medium"
+}
+
+variable "dms_storage_size" {
+  description = "Storage size in GB for DMS replication instance"
+  type        = number
+  default     = 50
+}
+
+# Redshift Configuration
+variable "redshift_username" {
+  description = "Redshift master username"
+  type        = string
+  default     = "admin"
+}
+
+variable "redshift_password" {
+  description = "Redshift master password"
+  type        = string
+  sensitive   = true
+}
+
+variable "redshift_node_type" {
+  description = "Redshift node type"
+  type        = string
+  default     = "dc2.large"
+}
+
+variable "redshift_cluster_type" {
+  description = "Redshift cluster type (single-node or multi-node)"
+  type        = string
+  default     = "single-node"
+}
+
+variable "redshift_node_count" {
+  description = "Number of nodes for Redshift cluster (if multi-node)"
+  type        = number
+  default     = 2
+}
+
+variable "redshift_access_cidr" {
+  description = "CIDR blocks that can access Redshift"
+  type        = list(string)
+  default     = ["10.0.0.0/8"]
+}

@@ -1,0 +1,571 @@
+# AWS Databricks Modern Data Engineering Architecture
+# Terraform Infrastructure as Code
+
+# Provider Configuration
+provider "aws" {
+  region = var.aws_region
+}
+
+provider "databricks" {
+  host = var.databricks_host
+  token = var.databricks_token
+}
+
+# Random string for unique resource names
+resource "random_string" "suffix" {
+  length  = 8
+  special = false
+  upper   = false
+}
+
+#------------------------------------------------------------------------------
+# 1. S3 Storage Layer
+#------------------------------------------------------------------------------
+
+# S3 Buckets for medallion architecture
+resource "aws_s3_bucket" "data_lake" {
+  for_each = toset(var.data_zones)
+  
+  bucket = "data-lake-${each.key}-${random_string.suffix.result}"
+  
+  tags = {
+    Name = "Redshift Security Group"
+    Environment = var.environment
+  }
+}
+
+#------------------------------------------------------------------------------
+# 4. Identity & Access Management
+#------------------------------------------------------------------------------
+
+# IAM role for Databricks to access AWS resources
+resource "aws_iam_role" "databricks_cross_account_role" {
+  name = "databricks-cross-account-role-${var.environment}"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          AWS = "arn:aws:iam::${var.databricks_account_id}:root"
+        }
+        Condition = {
+          StringEquals = {
+            "sts:ExternalId" = var.databricks_external_id
+          }
+        }
+      }
+    ]
+  })
+  
+  tags = {
+    Name = "Databricks Cross-Account Role"
+    Environment = var.environment
+  }
+}
+
+# IAM policy for Databricks S3 access
+resource "aws_iam_policy" "databricks_s3_access" {
+  name        = "databricks-s3-access-${var.environment}"
+  description = "Policy for Databricks to access S3 buckets"
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket",
+          "s3:GetBucketLocation"
+        ]
+        Resource = concat(
+          [for bucket in aws_s3_bucket.data_lake : bucket.arn],
+          [aws_s3_bucket.monitoring.arn]
+        )
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:DeleteObject",
+          "s3:PutObjectAcl"
+        ]
+        Resource = concat(
+          [for bucket in aws_s3_bucket.data_lake : "${bucket.arn}/*"],
+          ["${aws_s3_bucket.monitoring.arn}/*"]
+        )
+      }
+    ]
+  })
+}
+
+# IAM policy for Databricks Kinesis access
+resource "aws_iam_policy" "databricks_kinesis_access" {
+  name        = "databricks-kinesis-access-${var.environment}"
+  description = "Policy for Databricks to access Kinesis streams"
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "kinesis:DescribeStream",
+          "kinesis:GetShardIterator",
+          "kinesis:GetRecords",
+          "kinesis:ListShards"
+        ]
+        Resource = aws_kinesis_stream.data_stream.arn
+      }
+    ]
+  })
+}
+
+# IAM policy for Databricks Glue Catalog access
+resource "aws_iam_policy" "databricks_glue_access" {
+  name        = "databricks-glue-access-${var.environment}"
+  description = "Policy for Databricks to access Glue Data Catalog"
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "glue:CreateDatabase",
+          "glue:DeleteDatabase",
+          "glue:GetDatabase",
+          "glue:GetDatabases",
+          "glue:UpdateDatabase",
+          "glue:CreateTable",
+          "glue:DeleteTable",
+          "glue:BatchDeleteTable",
+          "glue:UpdateTable",
+          "glue:GetTable",
+          "glue:GetTables",
+          "glue:BatchCreatePartition",
+          "glue:CreatePartition",
+          "glue:DeletePartition",
+          "glue:BatchDeletePartition",
+          "glue:UpdatePartition",
+          "glue:GetPartition",
+          "glue:GetPartitions",
+          "glue:BatchGetPartition"
+        ]
+        Resource = [
+          "arn:aws:glue:${var.aws_region}:${var.aws_account_id}:catalog",
+          "arn:aws:glue:${var.aws_region}:${var.aws_account_id}:database/*",
+          "arn:aws:glue:${var.aws_region}:${var.aws_account_id}:table/*"
+        ]
+      }
+    ]
+  })
+}
+
+# Attach policies to the Databricks role
+resource "aws_iam_role_policy_attachment" "databricks_s3_attach" {
+  role       = aws_iam_role.databricks_cross_account_role.name
+  policy_arn = aws_iam_policy.databricks_s3_access.arn
+}
+
+resource "aws_iam_role_policy_attachment" "databricks_kinesis_attach" {
+  role       = aws_iam_role.databricks_cross_account_role.name
+  policy_arn = aws_iam_policy.databricks_kinesis_access.arn
+}
+
+resource "aws_iam_role_policy_attachment" "databricks_glue_attach" {
+  role       = aws_iam_role.databricks_cross_account_role.name
+  policy_arn = aws_iam_policy.databricks_glue_access.arn
+}
+
+#------------------------------------------------------------------------------
+# 5. Monitoring & Alerting
+#------------------------------------------------------------------------------
+
+# SNS Topic for data quality alerts
+resource "aws_sns_topic" "data_quality_alerts" {
+  name = "data-quality-alerts-${var.environment}"
+  
+  tags = {
+    Name = "Data Quality Alerts"
+    Environment = var.environment
+  }
+}
+
+# CloudWatch Dashboard for data pipeline monitoring
+resource "aws_cloudwatch_dashboard" "data_engineering" {
+  dashboard_name = "DataEngineering-${var.environment}"
+  
+  dashboard_body = jsonencode({
+    widgets = [
+      {
+        type = "metric"
+        x = 0
+        y = 0
+        width = 12
+        height = 6
+        properties = {
+          metrics = [
+            ["AWS/Kinesis", "IncomingRecords", "StreamName", aws_kinesis_stream.data_stream.name],
+            [".", "GetRecords.IteratorAgeMilliseconds", ".", "."]
+          ]
+          view = "timeSeries"
+          stacked = false
+          region = var.aws_region
+          title = "Kinesis Stream Metrics"
+          period = 300
+        }
+      },
+      {
+        type = "metric"
+        x = 12
+        y = 0
+        width = 12
+        height = 6
+        properties = {
+          metrics = [
+            ["AWS/S3", "BucketSizeBytes", "BucketName", aws_s3_bucket.data_lake["raw"].id, "StorageType", "StandardStorage"],
+            ["...", aws_s3_bucket.data_lake["processed"].id, ".", "."],
+            ["...", aws_s3_bucket.data_lake["curated"].id, ".", "."]
+          ]
+          view = "timeSeries"
+          stacked = false
+          region = var.aws_region
+          title = "Data Lake Size"
+          period = 86400
+        }
+      },
+      {
+        type = "metric"
+        x = 0
+        y = 6
+        width = 12
+        height = 6
+        properties = {
+          metrics = [
+            ["AWS/DMS", "CDCLatencySource", "ReplicationInstanceIdentifier", aws_dms_replication_instance.data_migration.replication_instance_id],
+            [".", "CDCLatencyTarget", ".", "."]
+          ]
+          view = "timeSeries"
+          stacked = false
+          region = var.aws_region
+          title = "DMS CDC Latency"
+          period = 60
+        }
+      },
+      {
+        type = "metric"
+        x = 12
+        y = 6
+        width = 12
+        height = 6
+        properties = {
+          metrics = [
+            ["AWS/Redshift", "CPUUtilization", "ClusterIdentifier", aws_redshift_cluster.data_warehouse.id],
+            [".", "DatabaseConnections", ".", "."]
+          ]
+          view = "timeSeries"
+          stacked = false
+          region = var.aws_region
+          title = "Redshift Performance"
+          period = 300
+        }
+      }
+    ]
+  })
+}
+
+#------------------------------------------------------------------------------
+# 6. AWS Glue Data Catalog
+#------------------------------------------------------------------------------
+
+# Glue Database for data catalog
+resource "aws_glue_catalog_database" "data_catalog" {
+  name = "data_engineering_${var.environment}"
+  description = "Data Engineering Catalog for ${var.environment}"
+}
+
+# Example Glue Table for customer data
+resource "aws_glue_catalog_table" "customers" {
+  name          = "customers"
+  database_name = aws_glue_catalog_database.data_catalog.name
+  
+  table_type = "EXTERNAL_TABLE"
+  
+  parameters = {
+    EXTERNAL              = "TRUE"
+    "parquet.compression" = "SNAPPY"
+  }
+  
+  storage_descriptor {
+    location      = "s3://${aws_s3_bucket.data_lake["curated"].id}/customers/"
+    input_format  = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
+    output_format = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
+    
+    ser_de_info {
+      name                  = "ParquetHiveSerDe"
+      serialization_library = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+      
+      parameters = {
+        "serialization.format" = 1
+      }
+    }
+    
+    columns {
+      name = "customer_id"
+      type = "string"
+    }
+    
+    columns {
+      name = "name"
+      type = "string"
+    }
+    
+    columns {
+      name = "email"
+      type = "string"
+    }
+    
+    columns {
+      name = "customer_segment"
+      type = "string"
+    }
+    
+    columns {
+      name = "signup_date"
+      type = "timestamp"
+    }
+    
+    columns {
+      name = "last_activity"
+      type = "timestamp"
+    }
+    
+    columns {
+      name = "total_orders"
+      type = "int"
+    }
+    
+    columns {
+      name = "total_spend"
+      type = "double"
+    }
+  }
+}
+
+#------------------------------------------------------------------------------
+# 7. Outputs
+#------------------------------------------------------------------------------
+
+# Output the S3 bucket names
+output "data_lake_buckets" {
+  description = "Data Lake S3 bucket names"
+  value = {
+    for zone, bucket in aws_s3_bucket.data_lake : zone => bucket.id
+  }
+}
+
+# Output the Kinesis stream name
+output "kinesis_stream_name" {
+  description = "Kinesis stream name for real-time data"
+  value       = aws_kinesis_stream.data_stream.name
+}
+
+# Output the Redshift endpoint
+output "redshift_endpoint" {
+  description = "Redshift cluster endpoint"
+  value       = aws_redshift_cluster.data_warehouse.endpoint
+}
+
+# Output the IAM role ARN for Databricks
+output "databricks_role_arn" {
+  description = "IAM role ARN for Databricks"
+  value       = aws_iam_role.databricks_cross_account_role.arn
+}
+
+# Output the Glue database name
+output "glue_database_name" {
+  description = "Glue catalog database name"
+  value       = aws_glue_catalog_database.data_catalog.name
+}Data Lake - ${each.key}"
+    Zone = each.key
+    Environment = var.environment
+  }
+}
+
+# Enable versioning on the buckets
+resource "aws_s3_bucket_versioning" "data_lake_versioning" {
+  for_each = aws_s3_bucket.data_lake
+  
+  bucket = each.value.id
+  
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+# S3 lifecycle policies based on data zone
+resource "aws_s3_bucket_lifecycle_configuration" "data_lake_lifecycle" {
+  for_each = aws_s3_bucket.data_lake
+  
+  bucket = each.value.id
+
+  rule {
+    id     = "transition-to-ia"
+    status = "Enabled"
+
+    filter {
+      prefix = ""
+    }
+
+    transition {
+      days          = lookup(var.transition_days, each.key, 30)
+      storage_class = "STANDARD_IA"
+    }
+  }
+}
+
+# Monitoring bucket for logs, checkpoints, etc.
+resource "aws_s3_bucket" "monitoring" {
+  bucket = "data-lake-monitoring-${random_string.suffix.result}"
+  
+  tags = {
+    Name = "Data Lake - Monitoring"
+    Environment = var.environment
+  }
+}
+
+#------------------------------------------------------------------------------
+# 2. Data Ingestion Layer
+#------------------------------------------------------------------------------
+
+# Kinesis Stream for real-time data
+resource "aws_kinesis_stream" "data_stream" {
+  name             = "customer-events-stream"
+  shard_count      = var.kinesis_shard_count
+  retention_period = 24
+  
+  shard_level_metrics = [
+    "IncomingBytes",
+    "OutgoingBytes",
+    "IncomingRecords",
+    "OutgoingRecords",
+    "WriteProvisionedThroughputExceeded",
+    "ReadProvisionedThroughputExceeded"
+  ]
+  
+  tags = {
+    Name = "Data Engineering Stream"
+    Environment = var.environment
+  }
+}
+
+# DMS for database migration
+resource "aws_dms_replication_instance" "data_migration" {
+  replication_instance_id      = "data-migration-${var.environment}"
+  replication_instance_class   = var.dms_instance_type
+  allocated_storage            = var.dms_storage_size
+  multi_az                     = var.environment == "production" ? true : false
+  publicly_accessible          = false
+  auto_minor_version_upgrade   = true
+  vpc_security_group_ids       = [aws_security_group.dms_sg.id]
+  replication_subnet_group_id  = aws_dms_replication_subnet_group.dms_subnet_group.id
+  
+  tags = {
+    Name = "Data Migration Instance"
+    Environment = var.environment
+  }
+}
+
+# DMS subnet group
+resource "aws_dms_replication_subnet_group" "dms_subnet_group" {
+  replication_subnet_group_id          = "dms-subnet-group-${var.environment}"
+  replication_subnet_group_description = "DMS subnet group for ${var.environment}"
+  subnet_ids                           = var.subnet_ids
+  
+  tags = {
+    Name = "DMS Subnet Group"
+    Environment = var.environment
+  }
+}
+
+# Security group for DMS
+resource "aws_security_group" "dms_sg" {
+  name        = "dms-security-group-${var.environment}"
+  description = "Security group for DMS replication instance"
+  vpc_id      = var.vpc_id
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "DMS Security Group"
+    Environment = var.environment
+  }
+}
+
+#------------------------------------------------------------------------------
+# 3. Data Warehouse Layer
+#------------------------------------------------------------------------------
+
+# Redshift cluster for data warehousing
+resource "aws_redshift_cluster" "data_warehouse" {
+  cluster_identifier        = "data-warehouse-${var.environment}"
+  database_name             = "analytics"
+  master_username           = var.redshift_username
+  master_password           = var.redshift_password
+  node_type                 = var.redshift_node_type
+  cluster_type              = var.redshift_cluster_type
+  number_of_nodes           = var.redshift_cluster_type == "single-node" ? null : var.redshift_node_count
+  skip_final_snapshot       = var.environment == "production" ? false : true
+  final_snapshot_identifier = var.environment == "production" ? "data-warehouse-final-${formatdate("YYYY-MM-DD", timestamp())}" : null
+  vpc_security_group_ids    = [aws_security_group.redshift_sg.id]
+  cluster_subnet_group_name = aws_redshift_subnet_group.redshift_subnet_group.name
+  encrypted                 = true
+  
+  tags = {
+    Name = "Data Warehouse"
+    Environment = var.environment
+  }
+}
+
+# Redshift subnet group
+resource "aws_redshift_subnet_group" "redshift_subnet_group" {
+  name       = "redshift-subnet-group-${var.environment}"
+  subnet_ids = var.subnet_ids
+  
+  tags = {
+    Name = "Redshift Subnet Group"
+    Environment = var.environment
+  }
+}
+
+# Security group for Redshift
+resource "aws_security_group" "redshift_sg" {
+  name        = "redshift-security-group-${var.environment}"
+  description = "Security group for Redshift cluster"
+  vpc_id      = var.vpc_id
+  
+  ingress {
+    from_port   = 5439
+    to_port     = 5439
+    protocol    = "tcp"
+    cidr_blocks = var.redshift_access_cidr
+  }
+  
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+  
+  tags = {
+    Name = "
